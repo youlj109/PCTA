@@ -8,9 +8,8 @@ from sklearn.feature_selection import SelectKBest
 from sklearn.feature_selection import f_classif
 from sklearn.neighbors import KNeighborsClassifier
 from torch.cuda.amp import autocast, GradScaler
+from imagenet_c import corrupt
 import torchvision.transforms as transforms
-from alg.logitadjust import LogitAdjust
-from alg.proco import ProCoLoss
 @torch.jit.script
 def softmax_entropy(x: torch.Tensor) -> torch.Tensor:
     """Entropy of softmax distribution from logits."""
@@ -26,13 +25,42 @@ def collect_params(model):
     params = []
     names = []
     for nm, m in model.named_modules():
-        if isinstance(m, nn.BatchNorm2d):
+        if isinstance(m,(nn.BatchNorm2d, nn.GroupNorm, nn.LayerNorm)):
             for np, p in m.named_parameters():
                 if np in ['weight', 'bias']:  # weight is scale, bias is shift
                     params.append(p)
                     names.append(f"{nm}.{np}")
     return params, names
 
+def collect_params_sar(model, logger=None):
+    """Collect the affine scale + shift parameters from norm layers.
+    Walk the model's modules and collect all normalization parameters.
+    Return the parameters and their names.
+    Note: other choices of parameterization are possible!
+    """
+    params = []
+    names = []
+    for nm, m in model.named_modules():
+        # skip top layers for adaptation: layer4 for ResNets and blocks9-11 for Vit-Base
+        if 'layer4' in nm:
+            continue
+        if 'blocks.9' in nm:
+            continue
+        if 'blocks.10' in nm:
+            continue
+        if 'blocks.11' in nm:
+            continue
+        if 'norm.' in nm:
+            continue
+        if nm in ['norm']:
+            continue
+
+        if isinstance(m, (nn.BatchNorm2d, nn.LayerNorm, nn.GroupNorm)):
+            for np, p in m.named_parameters():
+                if np in ['weight', 'bias']:  # weight is scale, bias is shift
+                    params.append(p)
+                    names.append(f"{nm}.{np}")
+    return params, names
 
 def copy_model_and_optimizer(model, optimizer):
     """Copy the model and optimizer states for resetting after adaptation."""
@@ -48,10 +76,9 @@ def load_model_and_optimizer(model, optimizer, model_state, optimizer_state):
 
 
 def configure_model(model):
-    """Configure model for use with tent."""
-    # train mode, because tent optimizes the model to minimize entropy
+    # train mode, because eata optimizes the model to minimize entropy
     model.train()
-    # disable grad, to (re-)enable only what tent updates
+    # disable grad, to (re-)enable only what eata updates
     model.requires_grad_(False)
     # configure norm for tent updates: enable grad + force batch statisics
     for m in model.modules():
@@ -61,8 +88,9 @@ def configure_model(model):
             m.track_running_stats = False
             m.running_mean = None
             m.running_var = None
+        if isinstance(m, (nn.GroupNorm, nn.LayerNorm)):
+            m.requires_grad_(True)
     return model
-
 
 def check_model(model):
     """Check model for compatability with tent."""
@@ -90,12 +118,16 @@ class ERM(nn.Module):
     def forward(self, x):
         z = self.featurizer(x)
         p = self.classifier(z)
-        return p  
+        return z, p  
 
 class BN(nn.Module):
     def __init__(self, model, steps=1, episodic=False):
         super().__init__()
         self.model = model
+
+        self.featurizer=model.featurizer
+        self.classifier=model.classifier
+
         self.steps = steps
         self.episodic = episodic
         assert self.steps>=0, 'steps must be non-negative'
@@ -104,12 +136,15 @@ class BN(nn.Module):
     
     @torch.no_grad()
     def forward(self, x):
+        with torch.no_grad():
+            z=self.featurizer(x)
+
         if self.steps>0:
             for _ in range(self.steps):
                 outputs = self.model.predict(x)
         else:
             outputs = self.model.predict(x)
-        return outputs
+        return z,outputs
 
 
 class Tent(nn.Module):
@@ -121,6 +156,8 @@ class Tent(nn.Module):
     def __init__(self, model, optimizer, steps=1, episodic=False):
         super().__init__()
         self.model = model
+        self.classifier = model.classifier
+        self.featurizer = model.featurizer
         self.optimizer = optimizer
         self.steps = steps
         assert steps > 0, "tent requires >= 1 step(s) to forward and update"
@@ -136,9 +173,9 @@ class Tent(nn.Module):
             self.reset()
 
         for _ in range(self.steps):
-            outputs = self.forward_and_adapt(x, self.model, self.optimizer)
+            z, outputs = self.forward_and_adapt(x, self.model, self.optimizer)
 
-        return outputs
+        return z,outputs
 
     def reset(self):
         if self.model_state is None or self.optimizer_state is None:
@@ -152,19 +189,23 @@ class Tent(nn.Module):
         Measure entropy of the model prediction, take gradients, and update params.
         """
         # forward
+        with torch.no_grad():
+            z = self.featurizer(x)
         outputs = model.predict(x)
         # adapt
         loss = softmax_entropy(outputs).mean()
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()        
-        return outputs
+        return z, outputs
 
 
 class PseudoLabel(nn.Module):
     def __init__(self, model, optimizer, beta=0.9,steps=1, episodic=False):
         super().__init__()
         self.model = model
+        self.classifier = model.classifier
+        self.featurizer = model.featurizer 
         self.optimizer = optimizer
         self.steps = steps
         assert steps > 0, "requires >= 1 step(s) to forward and update"
@@ -191,6 +232,8 @@ class PseudoLabel(nn.Module):
     @torch.enable_grad()
     def forward_and_adapt(self,x, model, optimizer):
         # forward
+        with torch.no_grad():
+            z = self.featurizer(x)
         outputs = model.predict(x)
         # adapt        
         scores = F.softmax(outputs,1)
@@ -200,7 +243,7 @@ class PseudoLabel(nn.Module):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        return outputs
+        return z,outputs
 
         
 class T3A(nn.Module):
@@ -248,7 +291,7 @@ class T3A(nn.Module):
         supports = torch.nn.functional.normalize(supports, dim=1)
         weights = (supports.T @ (labels))
         
-        return z @ torch.nn.functional.normalize(weights, dim=0)
+        return z,z @ torch.nn.functional.normalize(weights, dim=0)
 
     def select_supports(self):
         ent_s = self.ent 
@@ -335,7 +378,8 @@ class TSD(nn.Module):
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-        return p
+
+        return z,p
 
     def select_supports(self):
         ent_s = self.ent
@@ -358,10 +402,10 @@ class TSD(nn.Module):
         
         return self.supports, self.labels
     
-    def prototype_loss(self,z,p,labels=None,use_hard=False,tau=1):    
-        z = F.normalize(z,1)
+    def prototype_loss(self,z,p,labels=None,use_hard=False,tau=1):     
+        z_n = F.normalize(z,1)
         p = F.normalize(p,1)
-        dist = z @ p.T / tau
+        dist = z_n @ p.T / tau
         if labels is None:
             _,labels = dist.max(1)
         if use_hard:
@@ -476,6 +520,8 @@ def soft_k_nearest_neighbors(features, features_bank, probs_bank):
 
     return pred_labels, pred_probs
 
+
+###--------------------------TEA--------------------------###
 class EnergyModel(nn.Module):
     """
     2024CVPR TEA: Test-time Energy Adaptation
@@ -483,8 +529,11 @@ class EnergyModel(nn.Module):
     def __init__(self, model):
         super(EnergyModel, self).__init__()
         self.f = model
+        self.featurizer=model.featurizer
+        self.classifier=model.classifier
 
     def classify(self, x):
+        #penult_z = self.f(x)
         penult_z = self.f.predict(x)
         return penult_z
     
@@ -544,6 +593,7 @@ class Energy(nn.Module):
         super().__init__()
 
         self.energy_model=EnergyModel(model)
+        self.classifier=self.energy_model.classifier
         self.replay_buffer = init_random(buffer_size, im_sz=im_sz, n_ch=n_ch)
         self.replay_buffer_old = deepcopy(self.replay_buffer)
         self.optimizer = optimizer
@@ -567,13 +617,14 @@ class Energy(nn.Module):
             copy_model_and_optimizer(self.energy_model, self.optimizer)
         
     def forward(self, x):
+
         if self.episodic:
             self.reset()
         for _ in range(self.steps):
-            outputs = forward_and_adapt(x, self.energy_model, self.optimizer, 
+            z,outputs = forward_and_adapt(x, self.energy_model, self.optimizer, 
                                         self.replay_buffer, self.sgld_steps, self.sgld_lr, self.sgld_std, self.reinit_freq,
                                         if_cond=self.if_cond, n_classes=self.n_classes)
-        return outputs
+        return z,outputs
 
     def reset(self):
         if self.model_state is None or self.optimizer_state is None:
@@ -612,8 +663,9 @@ def forward_and_adapt(x, energy_model, optimizer, replay_buffer, sgld_steps, sgl
     optimizer.step()
     optimizer.zero_grad()
     outputs = energy_model.classify(x)
-
-    return outputs
+    with torch.no_grad():
+        z=energy_model.featurizer(x)
+    return z,outputs
 
 def update_ema(ema, new_data):
     if ema is None:
@@ -622,8 +674,9 @@ def update_ema(ema, new_data):
         with torch.no_grad():
             return 0.9 * ema + (1 - 0.9) * new_data
 
-
-
+###--------------------------TEA--------------------------###
+   
+####------------------------SAR-----------------------------####
 class SAM(torch.optim.Optimizer):
     def __init__(self, params, base_optimizer, rho=0.05, adaptive=False, **kwargs):
         assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
@@ -693,6 +746,8 @@ class SAR(nn.Module):
     def __init__(self, model, optimizer, steps=1, episodic=False, margin_e0=0.4*math.log(1000), reset_constant_em=0.2):
         super().__init__()
         self.model = model
+        self.featurizer = model.featurizer
+        self.classifier = model.classifier
         self.optimizer = optimizer
         self.steps = steps
         assert steps > 0, "SAR requires >= 1 step(s) to forward and update"
@@ -710,12 +765,12 @@ class SAR(nn.Module):
             self.reset()
 
         for _ in range(self.steps):
-            outputs, ema, reset_flag = forward_and_adapt_sar(x, self.model, self.optimizer, self.margin_e0, self.reset_constant_em, self.ema)
+            z,outputs, ema, reset_flag = forward_and_adapt_sar(x, self.model, self.optimizer, self.margin_e0, self.reset_constant_em, self.ema)
             if reset_flag:
                 self.reset()
             self.ema = ema  # update moving average value of loss
         
-        return outputs
+        return z,outputs
     
     def reset(self):
         if self.model_state is None or self.optimizer_state is None:
@@ -732,6 +787,8 @@ def forward_and_adapt_sar(x, model, optimizer, margin,reset_constant,ema):
     optimizer.zero_grad()
     # forward
     outputs = model.predict(x)
+    with torch.no_grad():
+        z=model.featurizer(x)
     # adapt
     # filtering reliable samples/gradients for further adaptation; first time forward
     entropys = softmax_entropy(outputs)
@@ -759,9 +816,10 @@ def forward_and_adapt_sar(x, model, optimizer, margin,reset_constant,ema):
             print("ema < 0.2, now reset the model")
             reset_flag = True
 
-    return outputs, ema, reset_flag
+    return z, outputs, ema, reset_flag
+####------------------------SAR-----------------------------####
 
-
+####------------------------EATA-----------------------------####
 class EATA(nn.Module):   
     """EATA adapts a model by entropy minimization during testing.
     Once EATAed, a model adapts itself by updating on every forward.
@@ -770,6 +828,8 @@ class EATA(nn.Module):
     def __init__(self, model, optimizer, steps=1, fishers=None, fisher_alpha=2000.0, episodic=False, e_margin=math.log(1000)/2-1, d_margin=0.05):
         super().__init__()
         self.model = model
+        self.classifier=self.model.classifier
+        self.featurizer=self.model.featurizer
         self.optimizer = optimizer
         self.steps = steps
         assert steps > 0, "EATA requires >= 1 step(s) to forward and update"
@@ -795,12 +855,12 @@ class EATA(nn.Module):
             self.reset()
 
         for _ in range(self.steps):
-            outputs, num_counts_2, num_counts_1, updated_probs = forward_and_adapt_eata(x, self.model, self.optimizer, self.fishers, self.e_margin, self.current_model_probs, fisher_alpha=self.fisher_alpha, num_samples_update=self.num_samples_update_2, d_margin=self.d_margin)
+            z,outputs, num_counts_2, num_counts_1, updated_probs = forward_and_adapt_eata(x, self.model, self.optimizer, self.fishers, self.e_margin, self.current_model_probs, fisher_alpha=self.fisher_alpha, num_samples_update=self.num_samples_update_2, d_margin=self.d_margin)
             self.num_samples_update_2 += num_counts_2
             self.num_samples_update_1 += num_counts_1
             self.reset_model_probs(updated_probs)
         
-        return outputs
+        return z,outputs
     
     def reset(self):
         if self.model_state is None or self.optimizer_state is None:
@@ -817,6 +877,8 @@ class EATA(nn.Module):
 def forward_and_adapt_eata(x, model, optimizer, fishers, e_margin, current_model_probs, fisher_alpha=50.0, d_margin=0.05, scale_factor=2, num_samples_update=0):
     # forward
     outputs = model.predict(x)
+    with torch.no_grad():
+        z=model.featurizer(x)
     # adapt
     entropys = softmax_entropy(outputs)
     # filter unreliable samples
@@ -843,12 +905,14 @@ def forward_and_adapt_eata(x, model, optimizer, fishers, e_margin, current_model
         for name, param in model.named_parameters():
             if name in fishers:
                 ewc_loss += fisher_alpha * (fishers[name][0] * (param - fishers[name][1])**2).sum()
+
         loss += ewc_loss
+
     if x[ids1][ids2].size(0) != 0:
         loss.backward()
         optimizer.step()
     optimizer.zero_grad()
-    return outputs, entropys.size(0), filter_ids_1[0].size(0), updated_probs
+    return z, outputs, entropys.size(0), filter_ids_1[0].size(0), updated_probs
 
 def update_model_probs(current_model_probs, new_probs):
     if current_model_probs is None:
@@ -864,8 +928,9 @@ def update_model_probs(current_model_probs, new_probs):
         else:
             with torch.no_grad():
                 return 0.9 * current_model_probs + (1 - 0.9) * new_probs.mean(0)
+####------------------------EATA-----------------------------####
 
-
+####------------------------TIPI-----------------------------####
 scaler = GradScaler()
 scaler_adv = GradScaler()
 
@@ -886,6 +951,8 @@ class TIPI(nn.Module):
 
         configure_multiple_BN(model,["main","adv"]) 
         self.model = model
+        self.classifier = model.classifier
+        self.featurizer = model.featurizer
         params, _ = collect_params_TIPI(self.model)
 
         if optim == 'SGD':
@@ -946,11 +1013,13 @@ class TIPI(nn.Module):
             with torch.no_grad():
                 if self.use_test_bn_with_large_batches and x.shape[0] > self.large_batch_threshold:
                     pred = self.model.predict(x)
+                    z=self.featurizer(x)
                 else:
                     self.model.eval()
                     pred = self.model.predict(x)
+                    z=self.featurizer(x)
 
-        return pred
+        return z, pred
     
 class MultiBatchNorm2d(nn.Module):
     def __init__(self, bn, BN_layers=['main']):
@@ -1009,94 +1078,105 @@ def KL(logit1,logit2,reverse=False):
     logp2 = logit2.log_softmax(1) 
     return (p1*(logp1-logp2)).sum(1)
 
-class PCTA(nn.Module):
+
+class TCA():
     """
-    Probabilistic Contrastive Test Time Adaptation
+    Test-time Correlation Alignment (TCA)
     """
-    def __init__(self, model, optimizer, lam=1, k = 1, tao = 1, k_EM = 1, use_true_class_p = False):
-        super().__init__()
-        self.model = model
-        self.featurizer = model.featurizer
+    def __init__(self,model,filter_K=100,W_num_iterations=20,W_lr=0.001):
         self.classifier = model.classifier
-        self.optimizer = optimizer
-        self.k = k
-        self.lam = lam
-        self.tao = tao
-        self.k_EM = k_EM
-        self.use_true_class_p = use_true_class_p
+        self.filter_K = filter_K
+        self.W_num_iterations=W_num_iterations
+        self.W_lr=W_lr
 
-        if hasattr(self.classifier, 'fc') and hasattr(self.classifier.fc, 'weight'):
-            warmup_supports = self.classifier.fc.weight.data.detach()
-        else:
-            warmup_supports = self.classifier.weight.data.detach()
+
+    def calculate(self, num_classes, embeddings_arr, logits_arr, proportion_vector):
+
+        self.supports=embeddings_arr
+        all_z=embeddings_arr
+        self.num_classes=num_classes
+        self.labels=logits_arr
+
+        #self.uncertainty=self.compute_uncertainty(logits_arr)
+        self.uncertainty=softmax_entropy(logits_arr) #Entropy also reflects uncertainty
         
+        self.proportion=proportion_vector  
 
-        self.num_classes = warmup_supports.size()[0]
-        self.feat_dim = warmup_supports.size()[1]
-        self.warmup_supports = warmup_supports
-        warmup_prob = self.classifier(self.warmup_supports)    
+        supports, labels = self.select_supports_different_proportion()
+
+        z_w = self.linearCORAL(supports,all_z,num_iterations=self.W_num_iterations,learning_rate=self.W_lr) 
+
+        z_w_length = z_w.shape[0]
+        chunk_size=256 
+        p_w_chunks = []
         
-        self.warmup_ent = softmax_entropy(warmup_prob)  
-        self.warmup_labels = F.one_hot(warmup_prob.argmax(1), num_classes=self.num_classes).float() 
-        self.warmup_scores = F.softmax(warmup_prob,1)  
-                
-        self.supports = self.warmup_supports.data
-        self.ent = self.warmup_ent.data
-        self.output_labels = self.warmup_labels.data
-        self.cls_num_list = self.output_labels.sum(0)
-        self.output_scores = self.warmup_scores.data
-        self.criterion_ce = LogitAdjust(cls_num_list=torch.ones((1,self.num_classes)).cuda()).cuda()
-        self.criterion_scl = ProCoLoss(contrast_dim=self.feat_dim, temperature=self.tao, num_classes=self.num_classes).cuda()
-
-    def forward(self,x):
-        Device_ = x.device
-        feature_embeddings = self.featurizer(x)
+        for i in range(0, z_w_length, chunk_size):
+            chunk = z_w[i:i + chunk_size]
+            chunk_output = self.classifier(chunk)
+            p_w_chunks.append(chunk_output)
         
-        z = F.normalize(feature_embeddings,dim=1)
-        p = self.classifier(feature_embeddings)    
-            
-        #yhat = F.one_hot(p.argmax(1), num_classes=self.num_classes).float()
-        yhat = p.argmax(1)
-        ent = softmax_entropy(p)
+        p_w = torch.cat(p_w_chunks, dim=0)
+        return p_w
 
-        scores = F.softmax(p,1)
-
-        with torch.no_grad():
-            self.supports = self.supports.to(Device_) 
-            self.ent = self.ent.to(Device_)
-            self.output_labels = self.output_labels.to(Device_)       
-            self.output_scores = self.output_scores.to(Device_)       
-            
-            self.output_labels = torch.cat([self.output_labels,F.one_hot(yhat, num_classes=self.num_classes).float() ]) 
-            if self.use_true_class_p:
-                self.cls_num_list = self.output_labels.sum(dim=0)
-            else:
-                self.cls_num_list = torch.ones((1,self.num_classes)).cuda()
-            self.ent = torch.cat([self.ent,ent])
-            self.output_scores = torch.cat([self.output_scores,scores]) 
-
-            k = self.k
-            percentile_k_entropy = torch.quantile(softmax_entropy(scores), k)
-
-            selected_indices = (softmax_entropy(scores) <= percentile_k_entropy).nonzero(as_tuple=True)[0]
-
-        yhat_ = yhat
-        for _ in range(self.k_EM):
-            contrast_logits = self.criterion_scl(z, yhat_)
-            yhat_ = contrast_logits.argmax(1)
-        loss_probabilistic_contrastive = self.criterion_ce(F.softmax(contrast_logits[selected_indices]), yhat[selected_indices], self.cls_num_list)
-
-        loss_minimize_ent = self.ent_loss(scores[selected_indices])
-        
-        loss = loss_probabilistic_contrastive + self.lam*loss_minimize_ent
-
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        
-        return p
+    def compute_uncertainty(logits):
+        prob = F.softmax(logits, dim=-1)
+        max_indices = torch.argmax(prob, dim=-1)
+        onehot = F.one_hot(max_indices, num_classes=prob.size(-1)).float()
+        uncertainty = torch.norm(onehot - prob, p=2, dim=-1)
     
-    def ent_loss(self, scores):
-        cls_p_list = self.cls_num_list / self.cls_num_list.sum() * self.num_classes
-        loss = softmax_entropy(cls_p_list * scores).mean()        
-        return loss
+        return uncertainty
+
+    def coral_loss(self,C_s, C_t):
+        return torch.norm(C_s - C_t, p='fro') ** 2
+    
+    def compute_covariance(self,X):
+        X_mean = torch.mean(X, dim=0, keepdim=True)
+        X_cov = (X - X_mean).t() @ (X - X_mean) / (X.size(0) - 1)
+        return X_cov
+        
+    def linearCORAL(self,X_s, X_t, num_iterations=20, learning_rate=0.001):
+        C_s = self.compute_covariance(X_s)
+        X_s_mean = torch.mean(X_s, dim=0, keepdim=True)
+        C_t = self.compute_covariance(X_t)
+        X_t_mean = torch.mean(X_t, dim=0, keepdim=True)
+ 
+        d = X_s.size(1)
+        W = torch.eye(d).cuda()
+        W.requires_grad = True
+        optimizer = torch.optim.Adam([W], lr=learning_rate)
+        
+        for _ in range(num_iterations):
+            optimizer.zero_grad()
+
+            X_t = X_t.detach()  
+            C_s = C_s.detach()  
+            C_t_transformed = W.T @ C_t @ W
+            loss = self.coral_loss(C_t_transformed, C_s)
+            loss.backward()
+            optimizer.step()
+            # if _ % 10 == 0:
+            #     print(f'Iteration {_}: Loss = {loss.item()}')
+        return (X_t - X_t_mean) @ W.detach()  + X_s_mean
+    
+    
+    def select_supports_different_proportion(self):
+        all_samples_num=0
+        uncertainty = self.uncertainty
+        y_hat = self.labels.argmax(dim=1).long()
+        filter_K = self.filter_K
+        if filter_K == -1:
+            indices = torch.LongTensor(list(range(len(uncertainty))))
+            return self.supports, self.labels
+
+        indices = []
+        indices1 = torch.LongTensor(list(range(len(uncertainty)))).cuda()
+        for i in range(self.num_classes):
+            _, indices2 = torch.sort(uncertainty[y_hat == i])
+            indices.append(indices1[y_hat==i][indices2][:math.floor(filter_K*self.proportion[i])])
+            all_samples_num+=math.floor(filter_K*self.proportion[i])
+        indices = torch.cat(indices)
+        self.supports = self.supports[indices]
+        self.labels = self.labels[indices]
+        
+        return self.supports, self.labels
+        
